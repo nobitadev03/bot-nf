@@ -1,0 +1,9 @@
+services:
+  - type: background
+    name: telegram-bot
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TOKEN
+        value: "${TOKEN}" # Set this as a secret in Render
