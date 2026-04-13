@@ -60,19 +60,55 @@ bot.onText(/\/start/, (msg) => {
 
 // ===== PARSE =====
 function extractAccounts(content) {
-  // Tách block dựa trên từ khóa "Status:" hoặc "Token:" (linh hoạt hơn)
-  const blocks = content.split(/(?=Status:)/i);
   const results = [];
+  const seen = new Set();
+  const normalized = String(content || "").replace(/\r\n/g, "\n");
+  const addToken = (token, raw) => {
+    if (!token || /\s/.test(token) || token.length < 20 || seen.has(token)) return;
+    seen.add(token);
+    results.push({ token, raw });
+  };
+  const safeDecode = (value) => {
+    try {
+      return decodeURIComponent(value);
+    } catch (_) {
+      return value;
+    }
+  };
 
-  blocks.forEach(block => {
+  // Format 0: report của checker (chỉ lấy block ✅ để tránh noise)
+  const reportBlocks = normalized.match(/✅\s*NETFLIX Cookies[\s\S]*?(?=(?:\n[✅❌]\s*NETFLIX Cookies|\nSUMMARY|$))/g) || [];
+  reportBlocks.forEach((block) => {
+    const tokenMatch = block.match(/Token:\s*([^\s\n\r]+)/i);
+    if (tokenMatch) {
+      addToken(tokenMatch[1].trim(), block.trim());
+      return;
+    }
+    const urlMatch = block.match(/Login URL:\s*\S*nftoken=([^\s\n\r&]+)/i);
+    if (urlMatch) addToken(safeDecode(urlMatch[1]), block.trim());
+  });
+
+  // Format 1: block có "Status" + "Token"
+  const blocks = normalized.split(/(?=Status:)/i);
+  blocks.forEach((block) => {
     if (!block.trim()) return;
     const tokenMatch = block.match(/Token:\s*([^\s\n\r]+)/i);
     if (!tokenMatch) return;
+    addToken(tokenMatch[1].trim(), block.trim());
+  });
 
-    results.push({
-      token: tokenMatch[1].trim(),
-      raw: block.trim()
-    });
+  // Format 2: mỗi dòng là token hoặc URL có nftoken=
+  normalized.split("\n").forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    const fromField = trimmed.match(/^Token:\s*([^\s]+)$/i);
+    const fromUrl = trimmed.match(/[?&]nftoken=([^&\s]+)/i);
+    const rawToken = fromField ? fromField[1] : (fromUrl ? safeDecode(fromUrl[1]) : trimmed);
+
+    // Loại bớt các dòng metadata không phải token
+    if (/^(Status|Premium|Country|Plan|Price|Billing|Email|Phone|Profiles|NetflixId|Login URL|Token Expires|Time Remaining)\s*:/i.test(trimmed)) return;
+    addToken(rawToken, `Token: ${rawToken}`);
   });
 
   return results;
@@ -198,11 +234,12 @@ bot.on("document", async (msg) => {
   try {
     bot.sendMessage(chatId, "⏳ Đang xử lý file, vui lòng đợi...");
 
-    const file = await bot.getFile(msg.document.file_id);
-    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
-
-    const res = await axios.get(url, { responseType: 'text' });
-    const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    const fileUrl = await bot.getFileLink(msg.document.file_id);
+    const res = await axios.get(fileUrl, {
+      responseType: "arraybuffer",
+      timeout: 30000
+    });
+    const content = Buffer.from(res.data).toString("utf8");
     const accounts = extractAccounts(content);
 
     if (!accounts.length) {
@@ -231,7 +268,7 @@ bot.on("document", async (msg) => {
     sendMainMenu(chatId);
 
   } catch (e) {
-    log(e.message);
+    log(`Lỗi xử lý file: ${e.message}`);
     bot.sendMessage(chatId, "❌ Lỗi khi xử lý file.");
   }
 });
