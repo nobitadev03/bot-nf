@@ -7,6 +7,22 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 
 const PAGE_SIZE = 10;
 
+const DB_FILE = "database.json";
+
+// ===== DATABASE =====
+function loadDB() {
+  if (!fs.existsSync(DB_FILE)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveDB(data) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
+
 const userData = {};
 
 // ===== LOG =====
@@ -14,31 +30,48 @@ function log(msg) {
   console.log(`[${new Date().toLocaleString()}] ${msg}`);
 }
 
-// ===== START =====
-bot.onText(/\/start/, (msg) => {
+// ===== MENU =====
+function sendMainMenu(chatId) {
   bot.sendMessage(
-    msg.chat.id,
-    "🤖 BOT TOOL TOKEN\n\n📌 Gửi file .txt để bắt đầu",
+    chatId,
+    "🤖 **BOT QUẢN LÝ NETFLIX**\n\nChọn một chức năng bên dưới:",
     {
+      parse_mode: "Markdown",
       reply_markup: {
-        remove_keyboard: true // ❌ xoá menu dưới
+        inline_keyboard: [
+          [
+            { text: "📦 Kho Token", callback_data: "menu_inventory" },
+            { text: "➕ Thêm Token", callback_data: "menu_add" }
+          ],
+          [
+            { text: "🔗 Lấy Link", callback_data: "menu_get" }
+          ]
+        ]
       }
     }
   );
+}
+
+// ===== START =====
+bot.onText(/\/start/, (msg) => {
+  userData[msg.chat.id] = { mode: null };
+  sendMainMenu(msg.chat.id);
 });
 
 // ===== PARSE =====
 function extractAccounts(content) {
-  const blocks = content.split(/\n(?=Status:)/);
+  // Tách block dựa trên từ khóa "Status:" hoặc "Token:" (linh hoạt hơn)
+  const blocks = content.split(/(?=Status:)/i);
   const results = [];
 
   blocks.forEach(block => {
-    const tokenMatch = block.match(/Token:\s*(.+)/);
+    if (!block.trim()) return;
+    const tokenMatch = block.match(/Token:\s*([^\s\n\r]+)/i);
     if (!tokenMatch) return;
 
     results.push({
       token: tokenMatch[1].trim(),
-      raw: block
+      raw: block.trim()
     });
   });
 
@@ -48,7 +81,7 @@ function extractAccounts(content) {
 function parseInfo(raw) {
   const get = (key) => {
     const m = raw.match(new RegExp(`${key}:\\s*(.+)`));
-    return m ? m[1].trim() : "Không rõ";
+    return m ? m[1].trim() : "-";
   };
 
   return {
@@ -59,50 +92,46 @@ function parseInfo(raw) {
     price: get("Price"),
     member: get("Member Since"),
     payment: get("Payment Method"),
+    billing: get("Billing"),
+    owner: get("First Name"),
     phone: get("Phone"),
     phoneVerified: get("Phone Verified"),
     quality: get("Video Quality"),
     streams: get("Max Streams"),
     hold: get("Payment Hold"),
     extra: get("Extra Member"),
-    email: get("Email").replace("\\x40", "@"),
+    email: get("Email"),
     emailVerified: get("Email Verified"),
     profiles: get("Profiles")
   };
 }
 
 function vi(text) {
-  return {
-    "Valid": "Hoạt động",
-    "Yes": "Có",
-    "No": "Không"
-  }[text] || text;
+  if (text === "Yes") return "Có ✅";
+  if (text === "No") return "Không ❌";
+  if (text === "Valid") return "Hoạt động";
+  return text;
 }
 
-function formatInfo(info) {
+function formatInfo(info, token) {
+  const e = encodeURIComponent(token);
   return (
-    `📊 THÔNG TIN TÀI KHOẢN
-
-✅ Trạng thái: ${vi(info.status)}
-💎 Premium: ${vi(info.premium)}
-🌍 Quốc gia: ${info.country}
-📦 Gói: ${info.plan}
+`🌍 Quốc gia: ${info.country}
 💰 Giá: ${info.price}
-📅 Tham gia: ${info.member}
-
-📞 SĐT: ${info.phone}
-✔️ Xác minh SĐT: ${vi(info.phoneVerified)}
-
-🎬 Chất lượng: ${info.quality}
-👥 Số thiết bị: ${info.streams}
-
-⛔ Hold: ${vi(info.hold)}
-➕ Thành viên phụ: ${vi(info.extra)}
-
+💳 Thanh toán: ${info.payment}
+📅 Billing tiếp: ${info.billing}
+👤 Chủ TK: ${info.owner}
 📧 Email: ${info.email}
-✔️ Xác minh Email: ${vi(info.emailVerified)}
+📞 SĐT: ${info.phone}
+🎭 Số profiles: ${info.profiles}
+👥 Extra Members: ${vi(info.extra)}
+⏰ Thành viên từ: ${info.member}
 
-👤 Hồ sơ: ${info.profiles}`
+🔗 Link Login (Nhấn vào để COPY ngay):
+🖥 PC Login:
+https://netflix.com/?nftoken=${e}
+📱 Phone Login (Chuyên dùng cho iOS/Android):
+https://netflix.com/unsupported?nftoken=${e}`
   );
 }
 
@@ -162,39 +191,48 @@ function buildPage(chatId, page = 0) {
 bot.on("document", async (msg) => {
   const chatId = msg.chat.id;
 
+  if (!userData[chatId] || userData[chatId].mode !== "ADD_MODE") {
+    return bot.sendMessage(chatId, "❌ Vui lòng nhấn nút **Thêm Token** trước khi gửi file.", { parse_mode: "Markdown" });
+  }
+
   try {
+    bot.sendMessage(chatId, "⏳ Đang xử lý file, vui lòng đợi...");
+
     const file = await bot.getFile(msg.document.file_id);
     const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`;
 
-    const res = await axios.get(url);
-
-    const accounts = extractAccounts(res.data);
+    const res = await axios.get(url, { responseType: 'text' });
+    const content = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    const accounts = extractAccounts(content);
 
     if (!accounts.length) {
-      return bot.sendMessage(chatId, "❌ Không có token");
+      return bot.sendMessage(chatId, "❌ Không tìm thấy token trong file.");
     }
 
-    // lưu tạm
-    userData[chatId] = { accounts };
+    const db = loadDB();
+    const existingTokens = new Set(db.map(a => a.token));
+    let addedCount = 0;
 
-    // hỏi chọn thiết bị
-    bot.sendMessage(chatId, "📱 Bạn muốn dùng trên thiết bị nào?", {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "📱 Mobile", callback_data: "choose_mobile" },
-            { text: "💻 PC", callback_data: "choose_pc" }
-          ],
-          [
-            { text: "🔀 ALL", callback_data: "choose_all" }
-          ]
-        ]
+    accounts.forEach(acc => {
+      if (!existingTokens.has(acc.token)) {
+        db.push({
+          token: acc.token,
+          raw: acc.raw,
+          addedAt: new Date().toISOString()
+        });
+        addedCount++;
       }
     });
 
+    saveDB(db);
+    userData[chatId].mode = null; // Thoát mode sau khi thêm xong
+
+    bot.sendMessage(chatId, `✅ Đã thêm **${addedCount}** token mới vào kho!\n📦 Tổng cộng hiện tại: **${db.length}** token.`, { parse_mode: "Markdown" });
+    sendMainMenu(chatId);
+
   } catch (e) {
     log(e.message);
-    bot.sendMessage(chatId, "❌ Lỗi file");
+    bot.sendMessage(chatId, "❌ Lỗi khi xử lý file.");
   }
 });
 
@@ -203,87 +241,42 @@ bot.on("callback_query", (q) => {
   const chatId = q.message.chat.id;
   const data = q.data;
 
-  if (!userData[chatId]) return;
+  if (!userData[chatId]) userData[chatId] = {};
 
-  // chọn device
-  if (data.startsWith("choose_")) {
-    const device = data.replace("choose_", "");
-
-    bot.answerCallbackQuery(q.id, { text: `Đã chọn ${device}` });
-
-    // ẩn nút chọn
-    bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
-      chat_id: chatId,
-      message_id: q.message.message_id
-    });
-
-    const accounts = userData[chatId].accounts;
-
-    let links = [];
-
-    accounts.forEach(acc => {
-      const info = parseInfo(acc.raw);
-      const created = createLinks(acc.token, device);
-
-      created.forEach(link => {
-        links.push({
-          url: link,
-          info: info,
-          device: device
-        });
-      });
-    });
-
-    userData[chatId].links = links;
-
-    const pageData = buildPage(chatId, 0);
-
-    return bot.sendMessage(chatId, pageData.text, {
-      reply_markup: pageData.reply_markup
-    });
+  // --- MENU HANDLERS ---
+  if (data === "menu_inventory") {
+    const db = loadDB();
+    bot.answerCallbackQuery(q.id);
+    return bot.sendMessage(chatId, `📦 **KHO TOKEN HIỆN TẠI**\n\nHiện đang có: **${db.length}** tài khoản.`, { parse_mode: "Markdown" });
   }
 
-  // copy
-  if (data.startsWith("copy_")) {
-    const i = parseInt(data.split("_")[1]);
-    const item = userData[chatId].links[i];
-
-    return bot.sendMessage(chatId,
-      `📋 COPY LINK:\n\`\`\`\n${item.url}\n\`\`\``,
-      { parse_mode: "Markdown" }
-    );
+  if (data === "menu_add") {
+    userData[chatId].mode = "ADD_MODE";
+    bot.answerCallbackQuery(q.id);
+    return bot.sendMessage(chatId, "📤 Vui lòng gửi file `.txt` chứa token để thêm vào kho.\n\nNhấn /start để hủy bỏ.", { parse_mode: "Markdown" });
   }
 
-  // info
-  if (data.startsWith("info_")) {
-    const i = parseInt(data.split("_")[1]);
-    const item = userData[chatId].links[i];
+  if (data === "menu_get") {
+    const db = loadDB();
+    if (!db.length) {
+      bot.answerCallbackQuery(q.id, { text: "❌ Kho đã hết token!" });
+      return bot.sendMessage(chatId, "❌ Kho hiện đang trống, vui lòng thêm token.");
+    }
 
-    return bot.sendMessage(chatId, formatInfo(item.info));
-  }
+    // Lấy token đầu tiên (FIFO)
+    const account = db.shift();
+    saveDB(db);
 
-  // page
-  if (data.startsWith("page_")) {
-    const page = parseInt(data.split("_")[1]);
-    const pageData = buildPage(chatId, page);
-
-    return bot.editMessageText(pageData.text, {
-      chat_id: chatId,
-      message_id: q.message.message_id,
-      reply_markup: pageData.reply_markup
-    });
-  }
-
-  // download
-  if (data === "download") {
-    const fileName = `links_${chatId}.txt`;
-
-    fs.writeFileSync(fileName, userData[chatId].links.map(l => l.url).join("\n"));
-
-    bot.sendDocument(chatId, fileName).then(() => {
-      fs.unlinkSync(fileName);
-    });
+    const info = parseInfo(account.raw);
+    bot.answerCallbackQuery(q.id, { text: "Đã lấy 1 token!" });
+    
+    // Trả về thông tin và xóa khỏi DB
+    return bot.sendMessage(chatId, formatInfo(info, account.token));
   }
 
   bot.answerCallbackQuery(q.id);
 });
+
+// ===== START LOG =====
+log("Bot is running...");
+log("Load DB: " + loadDB().length + " accounts found.");
